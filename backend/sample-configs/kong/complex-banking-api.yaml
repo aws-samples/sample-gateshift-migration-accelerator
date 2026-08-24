@@ -1,0 +1,219 @@
+_format_version: "3.0"
+services:
+    - name: accounts-service
+      url: http://accounts-backend:8443
+      protocol: https
+      connect_timeout: 30000
+      read_timeout: 30000
+      retries: 3
+      routes:
+          - name: accounts-list
+            paths:
+                - /api/v1/accounts
+            methods:
+                - GET
+                - POST
+          - name: accounts-detail
+            paths:
+                - /api/v1/accounts/(?P<account_id>[^/]+)
+            methods:
+                - GET
+                - PATCH
+          - name: accounts-transactions
+            paths:
+                - /api/v1/accounts/(?P<account_id>[^/]+)/transactions
+            methods:
+                - GET
+      plugins:
+          - name: jwt
+            config:
+                claims_to_verify:
+                    - exp
+                    - nbf
+                key_claim_name: iss
+                maximum_expiration: 3600
+          - name: acl
+            config:
+                allow:
+                    - account-holders
+                    - back-office
+          - name: rate-limiting
+            config:
+                second: 5
+                minute: 120
+                policy: redis
+                redis_host: redis.banking.internal
+                redis_port: 6379
+          - name: request-validator
+            config:
+                body_schema: |
+                    {
+                      "type": "object",
+                      "properties": {
+                        "currency": {"type": "string", "enum": ["USD", "EUR", "GBP"]},
+                        "amount": {"type": "number", "minimum": 0}
+                      },
+                      "required": ["currency", "amount"]
+                    }
+          - name: response-transformer
+            config:
+                remove:
+                    headers:
+                        - "X-Backend-Server"
+                        - "Server"
+          - name: cors
+            config:
+                origins:
+                    - "https://app.bank.example.com"
+                methods:
+                    - GET
+                    - POST
+                    - PATCH
+                headers:
+                    - Authorization
+                    - Content-Type
+                    - X-Idempotency-Key
+                credentials: true
+                max_age: 3600
+
+    - name: payments-service
+      url: http://payments-backend:8443
+      protocol: https
+      routes:
+          - name: payments-create
+            paths:
+                - /api/v1/payments
+            methods:
+                - POST
+          - name: payments-detail
+            paths:
+                - /api/v1/payments/(?P<payment_id>[^/]+)
+            methods:
+                - GET
+                - DELETE
+      plugins:
+          - name: oauth2
+            config:
+                scopes:
+                    - payments:write
+                    - payments:read
+                mandatory_scope: true
+                enable_client_credentials: true
+                token_expiration: 1800
+          - name: hmac-auth
+            config:
+                clock_skew: 300
+                enforce_headers:
+                    - date
+                    - request-line
+          - name: request-transformer
+            config:
+                add:
+                    headers:
+                        - "X-Request-Source:api-gateway"
+                        - "X-Correlation-Id:$(correlation_id)"
+          - name: rate-limiting
+            config:
+                minute: 60
+                policy: local
+          - name: ip-restriction
+            config:
+                allow:
+                    - 10.0.0.0/8
+                    - 192.168.0.0/16
+
+    - name: statements-service
+      host: statements-upstream
+      port: 8080
+      protocol: http
+      routes:
+          - name: statements-download
+            paths:
+                - /api/v1/statements/(?P<year>\d{4})/(?P<month>\d{2})
+            methods:
+                - GET
+      plugins:
+          - name: key-auth
+            config:
+                key_names:
+                    - x-api-key
+          - name: proxy-cache
+            config:
+                response_code:
+                    - 200
+                request_method:
+                    - GET
+                content_type:
+                    - application/pdf
+                cache_ttl: 600
+          - name: request-size-limiting
+            config:
+                allowed_payload_size: 10
+
+    - name: health-service
+      url: http://health-backend:8080
+      routes:
+          - name: health-check
+            paths:
+                - /health
+                - /ready
+            methods:
+                - GET
+      plugins:
+          - name: request-termination
+            config:
+                status_code: 200
+                message: '{"status": "healthy"}'
+                content_type: "application/json"
+
+upstreams:
+    - name: statements-upstream
+      algorithm: consistent-hashing
+      hash_on: header
+      hash_on_header: X-Account-Id
+      targets:
+          - target: statements-1.internal:8080
+            weight: 100
+          - target: statements-2.internal:8080
+            weight: 50
+      healthchecks:
+          active:
+              http_path: /health
+              healthy:
+                  interval: 10
+                  successes: 2
+              unhealthy:
+                  interval: 5
+                  http_failures: 3
+
+consumers:
+    - username: mobile-banking-app
+      keyauth_credentials:
+          - key: mobile-banking-key-001
+      acls:
+          - group: account-holders
+    - username: back-office-portal
+      keyauth_credentials:
+          - key: back-office-key-001
+      acls:
+          - group: account-holders
+          - group: back-office
+    - username: reconciliation-bot
+      basicauth_credentials:
+          - username: recon
+            password: secure-recon-pass
+
+plugins:
+    - name: correlation-id
+      config:
+          header_name: X-Correlation-ID
+          generator: uuid
+          echo_downstream: true
+    - name: http-log
+      config:
+          http_endpoint: https://siem.bank.example.com/ingest
+          method: POST
+          timeout: 5000
+    - name: prometheus
+      config:
+          per_consumer: true

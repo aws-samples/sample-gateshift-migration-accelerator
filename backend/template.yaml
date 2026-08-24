@@ -1,0 +1,636 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: GateShift - AI-powered API Gateway Migration Tool
+
+Globals:
+    Function:
+        Runtime: python3.12
+        Timeout: 60
+        MemorySize: 256
+        Tracing: Active
+        Environment:
+            Variables:
+                ARTIFACTS_BUCKET: !Ref ArtifactsBucket
+                MIGRATIONS_TABLE: !Ref MigrationsTable
+                BEDROCK_MODEL_ID: !Ref BedrockModelId
+                BEDROCK_REGION: !Ref BedrockRegion
+
+Parameters:
+    BedrockModelId:
+        Type: String
+        Default: us.anthropic.claude-sonnet-4-20250514-v1:0
+        Description: >-
+            Bedrock model or inference profile ID used for analysis. Newer Claude
+            models require a cross-region inference profile ID (us. prefix).
+    BedrockRegion:
+        Type: String
+        Default: us-east-1
+        Description: Region hosting the Bedrock model.
+    AllowedOrigin:
+        Type: String
+        Default: http://localhost:3000
+        Description: >-
+            Exact origin permitted for browser calls and S3 uploads. Set to your
+            frontend origin. Wildcards are intentionally not used.
+    LogRetentionDays:
+        Type: Number
+        Default: 30
+        Description: CloudWatch log retention in days.
+        AllowedValues:
+            [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+Resources:
+    # ------------------------------------------------------------------
+    # Identity — Cognito User Pool provides authentication for the API
+    # ------------------------------------------------------------------
+    UserPool:
+        Type: AWS::Cognito::UserPool
+        Properties:
+            UserPoolName: !Sub "${AWS::StackName}-users"
+            # Self signup disabled: an administrator creates users explicitly.
+            AdminCreateUserConfig:
+                AllowAdminCreateUserOnly: true
+            UsernameAttributes:
+                - email
+            AutoVerifiedAttributes:
+                - email
+            MfaConfiguration: "OPTIONAL"
+            EnabledMfas:
+                - SOFTWARE_TOKEN_MFA
+            Policies:
+                PasswordPolicy:
+                    MinimumLength: 12
+                    RequireLowercase: true
+                    RequireUppercase: true
+                    RequireNumbers: true
+                    RequireSymbols: true
+                    TemporaryPasswordValidityDays: 3
+            UserPoolAddOns:
+                AdvancedSecurityMode: AUDIT
+
+    UserPoolClient:
+        Type: AWS::Cognito::UserPoolClient
+        Properties:
+            ClientName: !Sub "${AWS::StackName}-web"
+            UserPoolId: !Ref UserPool
+            # Public browser client: no secret, so it is never embedded in JS.
+            GenerateSecret: false
+            ExplicitAuthFlows:
+                - ALLOW_USER_PASSWORD_AUTH
+                - ALLOW_REFRESH_TOKEN_AUTH
+            PreventUserExistenceErrors: ENABLED
+            AccessTokenValidity: 60
+            IdTokenValidity: 60
+            RefreshTokenValidity: 1
+            TokenValidityUnits:
+                AccessToken: minutes
+                IdToken: minutes
+                RefreshToken: days
+            SupportedIdentityProviders:
+                - COGNITO
+
+    # ------------------------------------------------------------------
+    # Storage
+    # ------------------------------------------------------------------
+    ArtifactsBucket:
+        Type: AWS::S3::Bucket
+        # Retain so a stack delete never silently destroys migration output.
+        UpdateReplacePolicy: Retain
+        DeletionPolicy: Retain
+        Properties:
+            BucketName: !Sub "${AWS::StackName}-artifacts-${AWS::AccountId}"
+            BucketEncryption:
+                ServerSideEncryptionConfiguration:
+                    - ServerSideEncryptionByDefault:
+                          SSEAlgorithm: AES256
+                      BucketKeyEnabled: true
+            PublicAccessBlockConfiguration:
+                BlockPublicAcls: true
+                BlockPublicPolicy: true
+                IgnorePublicAcls: true
+                RestrictPublicBuckets: true
+            OwnershipControls:
+                Rules:
+                    - ObjectOwnership: BucketOwnerEnforced
+            VersioningConfiguration:
+                Status: Enabled
+            LifecycleConfiguration:
+                Rules:
+                    - Id: AbortIncompleteUploads
+                      Status: Enabled
+                      AbortIncompleteMultipartUpload:
+                          DaysAfterInitiation: 7
+                    - Id: ExpireOldVersions
+                      Status: Enabled
+                      NoncurrentVersionExpiration:
+                          NoncurrentDays: 30
+            CorsConfiguration:
+                CorsRules:
+                    - AllowedHeaders: ["content-type"]
+                      AllowedMethods: [PUT]
+                      AllowedOrigins:
+                          - !Ref AllowedOrigin
+                      MaxAge: 3600
+            LoggingConfiguration:
+                DestinationBucketName: !Ref AccessLogsBucket
+                LogFilePrefix: artifacts-access/
+
+    AccessLogsBucket:
+        Type: AWS::S3::Bucket
+        UpdateReplacePolicy: Retain
+        DeletionPolicy: Retain
+        Properties:
+            BucketName: !Sub "${AWS::StackName}-logs-${AWS::AccountId}"
+            BucketEncryption:
+                ServerSideEncryptionConfiguration:
+                    - ServerSideEncryptionByDefault:
+                          SSEAlgorithm: AES256
+            PublicAccessBlockConfiguration:
+                BlockPublicAcls: true
+                BlockPublicPolicy: true
+                IgnorePublicAcls: true
+                RestrictPublicBuckets: true
+            OwnershipControls:
+                Rules:
+                    - ObjectOwnership: BucketOwnerPreferred
+            LifecycleConfiguration:
+                Rules:
+                    - Id: ExpireLogs
+                      Status: Enabled
+                      ExpirationInDays: 90
+
+    # Deny any non-TLS request to the artifacts bucket.
+    ArtifactsBucketPolicy:
+        Type: AWS::S3::BucketPolicy
+        Properties:
+            Bucket: !Ref ArtifactsBucket
+            PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Sid: DenyInsecureTransport
+                      Effect: Deny
+                      Principal: "*"
+                      Action: "s3:*"
+                      Resource:
+                          - !Sub "${ArtifactsBucket.Arn}"
+                          - !Sub "${ArtifactsBucket.Arn}/*"
+                      Condition:
+                          Bool:
+                              aws:SecureTransport: false
+
+    AccessLogsBucketPolicy:
+        Type: AWS::S3::BucketPolicy
+        Properties:
+            Bucket: !Ref AccessLogsBucket
+            PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Sid: DenyInsecureTransport
+                      Effect: Deny
+                      Principal: "*"
+                      Action: "s3:*"
+                      Resource:
+                          - !Sub "${AccessLogsBucket.Arn}"
+                          - !Sub "${AccessLogsBucket.Arn}/*"
+                      Condition:
+                          Bool:
+                              aws:SecureTransport: false
+                    - Sid: AllowS3ServerAccessLogging
+                      Effect: Allow
+                      Principal:
+                          Service: logging.s3.amazonaws.com
+                      Action: "s3:PutObject"
+                      Resource: !Sub "${AccessLogsBucket.Arn}/*"
+                      Condition:
+                          StringEquals:
+                              aws:SourceAccount: !Ref AWS::AccountId
+
+    MigrationsTable:
+        Type: AWS::DynamoDB::Table
+        UpdateReplacePolicy: Retain
+        DeletionPolicy: Retain
+        Properties:
+            TableName: !Sub "${AWS::StackName}-migrations"
+            BillingMode: PAY_PER_REQUEST
+            SSESpecification:
+                SSEEnabled: true
+            PointInTimeRecoverySpecification:
+                PointInTimeRecoveryEnabled: true
+            AttributeDefinitions:
+                - AttributeName: migration_id
+                  AttributeType: S
+                - AttributeName: owner_sub
+                  AttributeType: S
+                - AttributeName: created_at
+                  AttributeType: S
+            KeySchema:
+                - AttributeName: migration_id
+                  KeyType: HASH
+            # Lets us list a caller's own migrations with a Query instead of a Scan.
+            GlobalSecondaryIndexes:
+                - IndexName: owner-index
+                  KeySchema:
+                      - AttributeName: owner_sub
+                        KeyType: HASH
+                      - AttributeName: created_at
+                        KeyType: RANGE
+                  Projection:
+                      ProjectionType: ALL
+
+    # ------------------------------------------------------------------
+    # API — every route requires a valid Cognito ID token
+    # ------------------------------------------------------------------
+    ApiAccessLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub "/aws/apigateway/${AWS::StackName}-access"
+            RetentionInDays: !Ref LogRetentionDays
+
+    ApiGatewayCloudWatchRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: apigateway.amazonaws.com
+                      Action: sts:AssumeRole
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+    # Account-level setting that permits API Gateway to write CloudWatch logs.
+    ApiGatewayAccount:
+        Type: AWS::ApiGateway::Account
+        Properties:
+            CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+    GateShiftApi:
+        Type: AWS::Serverless::Api
+        DependsOn: ApiGatewayAccount
+        Properties:
+            StageName: dev
+            TracingEnabled: true
+            MethodSettings:
+                - ResourcePath: "/*"
+                  HttpMethod: "*"
+                  LoggingLevel: ERROR
+                  MetricsEnabled: true
+                  DataTraceEnabled: false
+                  ThrottlingBurstLimit: 50
+                  ThrottlingRateLimit: 20
+            AccessLogSetting:
+                DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+                Format: >-
+                    {"requestId":"$context.requestId","ip":"$context.identity.sourceIp","caller":"$context.authorizer.claims.sub","httpMethod":"$context.httpMethod","path":"$context.path","status":"$context.status","latency":"$context.responseLatency"}
+            Auth:
+                DefaultAuthorizer: CognitoAuthorizer
+                Authorizers:
+                    CognitoAuthorizer:
+                        UserPoolArn: !GetAtt UserPool.Arn
+                        Identity:
+                            Header: Authorization
+                # CORS preflight must stay unauthenticated or browsers cannot
+                # complete the OPTIONS handshake.
+                AddDefaultAuthorizerToCorsPreflight: false
+            Cors:
+                AllowMethods: "'GET,POST,OPTIONS'"
+                AllowHeaders: "'Content-Type,Authorization'"
+                AllowOrigin: !Sub "'${AllowedOrigin}'"
+            # Ensure auth failures still carry CORS headers so the browser can
+            # surface a useful error instead of an opaque network failure.
+            GatewayResponses:
+                UNAUTHORIZED:
+                    StatusCode: 401
+                    ResponseParameters:
+                        Headers:
+                            Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+                            Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+                ACCESS_DENIED:
+                    StatusCode: 403
+                    ResponseParameters:
+                        Headers:
+                            Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+                            Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+                DEFAULT_4XX:
+                    ResponseParameters:
+                        Headers:
+                            Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+                            Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+
+    PresignUploadFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            Handler: api.presign_upload.handler
+            CodeUri: src/
+            ReservedConcurrentExecutions: 10
+            Environment:
+                Variables:
+                    ALLOWED_ORIGIN: !Ref AllowedOrigin
+            Policies:
+                # Upload presigning only ever needs to write under input/.
+                - Statement:
+                      - Effect: Allow
+                        Action: s3:PutObject
+                        Resource: !Sub "${ArtifactsBucket.Arn}/input/*"
+            Events:
+                Api:
+                    Type: Api
+                    Properties:
+                        RestApiId: !Ref GateShiftApi
+                        Path: /uploads/presign
+                        Method: POST
+
+    CreateMigrationFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            Handler: api.create_migration.handler
+            CodeUri: src/
+            ReservedConcurrentExecutions: 10
+            Environment:
+                Variables:
+                    # Scoped to this one function to avoid a circular dependency
+                    # between the pipeline functions and the state machine.
+                    STATE_MACHINE_ARN: !Ref MigrationPipeline
+                    ALLOWED_ORIGIN: !Ref AllowedOrigin
+            Policies:
+                - DynamoDBCrudPolicy:
+                      TableName: !Ref MigrationsTable
+                - StepFunctionsExecutionPolicy:
+                      StateMachineName: !GetAtt MigrationPipeline.Name
+            Events:
+                Api:
+                    Type: Api
+                    Properties:
+                        RestApiId: !Ref GateShiftApi
+                        Path: /migrations
+                        Method: POST
+
+    ListMigrationsFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            Handler: api.list_migrations.handler
+            CodeUri: src/
+            ReservedConcurrentExecutions: 10
+            Environment:
+                Variables:
+                    ALLOWED_ORIGIN: !Ref AllowedOrigin
+            Policies:
+                - DynamoDBReadPolicy:
+                      TableName: !Ref MigrationsTable
+            Events:
+                Api:
+                    Type: Api
+                    Properties:
+                        RestApiId: !Ref GateShiftApi
+                        Path: /migrations
+                        Method: GET
+
+    GetMigrationFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            Handler: api.get_migration.handler
+            CodeUri: src/
+            ReservedConcurrentExecutions: 10
+            Environment:
+                Variables:
+                    ALLOWED_ORIGIN: !Ref AllowedOrigin
+            Policies:
+                - DynamoDBReadPolicy:
+                      TableName: !Ref MigrationsTable
+            Events:
+                Api:
+                    Type: Api
+                    Properties:
+                        RestApiId: !Ref GateShiftApi
+                        Path: /migrations/{id}
+                        Method: GET
+
+    GetReportFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            Handler: api.get_report.handler
+            CodeUri: src/
+            ReservedConcurrentExecutions: 10
+            Environment:
+                Variables:
+                    ALLOWED_ORIGIN: !Ref AllowedOrigin
+            Policies:
+                - DynamoDBReadPolicy:
+                      TableName: !Ref MigrationsTable
+                - Statement:
+                      - Effect: Allow
+                        Action: s3:GetObject
+                        Resource: !Sub "${ArtifactsBucket.Arn}/migrations/*"
+            Events:
+                Api:
+                    Type: Api
+                    Properties:
+                        RestApiId: !Ref GateShiftApi
+                        Path: /migrations/{id}/report
+                        Method: GET
+
+    PresignDownloadFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            Handler: api.presign_download.handler
+            CodeUri: src/
+            ReservedConcurrentExecutions: 10
+            Environment:
+                Variables:
+                    ALLOWED_ORIGIN: !Ref AllowedOrigin
+            Policies:
+                - DynamoDBReadPolicy:
+                      TableName: !Ref MigrationsTable
+                - Statement:
+                      - Effect: Allow
+                        Action: s3:GetObject
+                        Resource: !Sub "${ArtifactsBucket.Arn}/migrations/*"
+            Events:
+                Api:
+                    Type: Api
+                    Properties:
+                        RestApiId: !Ref GateShiftApi
+                        Path: /migrations/{id}/download/{artifact}
+                        Method: GET
+
+    GetArtifactFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            Handler: api.get_artifact.handler
+            CodeUri: src/
+            ReservedConcurrentExecutions: 10
+            Environment:
+                Variables:
+                    ALLOWED_ORIGIN: !Ref AllowedOrigin
+            Policies:
+                - DynamoDBReadPolicy:
+                      TableName: !Ref MigrationsTable
+                - Statement:
+                      - Effect: Allow
+                        Action: s3:GetObject
+                        Resource: !Sub "${ArtifactsBucket.Arn}/migrations/*"
+            Events:
+                Api:
+                    Type: Api
+                    Properties:
+                        RestApiId: !Ref GateShiftApi
+                        Path: /migrations/{id}/artifact/{artifact}
+                        Method: GET
+
+    # ------------------------------------------------------------------
+    # Pipeline Lambdas — invoked only by Step Functions, never exposed
+    # ------------------------------------------------------------------
+    ParserFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            Handler: parser.handler.handler
+            CodeUri: src/
+            ReservedConcurrentExecutions: 5
+            Timeout: 120
+            Policies:
+                - DynamoDBCrudPolicy:
+                      TableName: !Ref MigrationsTable
+                - Statement:
+                      - Effect: Allow
+                        Action:
+                            - s3:GetObject
+                        Resource: !Sub "${ArtifactsBucket.Arn}/input/*"
+                      - Effect: Allow
+                        Action:
+                            - s3:PutObject
+                        Resource: !Sub "${ArtifactsBucket.Arn}/migrations/*"
+
+    AnalyzerFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            Handler: analyzer.handler.handler
+            CodeUri: src/
+            ReservedConcurrentExecutions: 5
+            Timeout: 300
+            MemorySize: 512
+            Policies:
+                - DynamoDBCrudPolicy:
+                      TableName: !Ref MigrationsTable
+                - Statement:
+                      - Effect: Allow
+                        Action:
+                            - s3:GetObject
+                            - s3:PutObject
+                        Resource: !Sub "${ArtifactsBucket.Arn}/migrations/*"
+                # Scoped to foundation models and inference profiles only.
+                - Statement:
+                      - Effect: Allow
+                        Action:
+                            - bedrock:InvokeModel
+                        Resource:
+                            - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                            - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
+
+    GeneratorFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            Handler: generator.handler.handler
+            CodeUri: src/
+            ReservedConcurrentExecutions: 5
+            Timeout: 120
+            Policies:
+                - DynamoDBCrudPolicy:
+                      TableName: !Ref MigrationsTable
+                - Statement:
+                      - Effect: Allow
+                        Action:
+                            - s3:GetObject
+                            - s3:PutObject
+                        Resource: !Sub "${ArtifactsBucket.Arn}/migrations/*"
+
+    # cfn-lint is heavy (bundled provider schemas), so it ships as a layer
+    # attached only to the validator instead of bloating the shared src bundle.
+    CfnLintLayer:
+        Type: AWS::Serverless::LayerVersion
+        Properties:
+            LayerName: !Sub "${AWS::StackName}-cfn-lint"
+            Description: cfn-lint library used by the validator to lint generated templates.
+            ContentUri: layers/cfnlint/
+            CompatibleRuntimes:
+                - python3.12
+            RetentionPolicy: Delete
+        Metadata:
+            BuildMethod: python3.12
+
+    ValidatorFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            Handler: validator.handler.handler
+            CodeUri: src/
+            ReservedConcurrentExecutions: 5
+            Timeout: 120
+            # cfn-lint's import/registry load is memory- and CPU-hungry.
+            MemorySize: 512
+            Layers:
+                - !Ref CfnLintLayer
+            Policies:
+                - DynamoDBCrudPolicy:
+                      TableName: !Ref MigrationsTable
+                - Statement:
+                      - Effect: Allow
+                        Action:
+                            - s3:GetObject
+                            - s3:PutObject
+                        Resource: !Sub "${ArtifactsBucket.Arn}/migrations/*"
+
+    # ------------------------------------------------------------------
+    # Orchestration
+    # ------------------------------------------------------------------
+    StateMachineLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub "/aws/vendedlogs/states/${AWS::StackName}-pipeline"
+            RetentionInDays: !Ref LogRetentionDays
+
+    MigrationPipeline:
+        Type: AWS::Serverless::StateMachine
+        Properties:
+            Name: !Sub "${AWS::StackName}-pipeline"
+            DefinitionUri: statemachine/pipeline.asl.json
+            Tracing:
+                Enabled: true
+            Logging:
+                Level: ALL
+                IncludeExecutionData: false
+                Destinations:
+                    - CloudWatchLogsLogGroup:
+                          LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+            DefinitionSubstitutions:
+                ParserFunctionArn: !GetAtt ParserFunction.Arn
+                AnalyzerFunctionArn: !GetAtt AnalyzerFunction.Arn
+                GeneratorFunctionArn: !GetAtt GeneratorFunction.Arn
+                ValidatorFunctionArn: !GetAtt ValidatorFunction.Arn
+            Policies:
+                - LambdaInvokePolicy:
+                      FunctionName: !Ref ParserFunction
+                - LambdaInvokePolicy:
+                      FunctionName: !Ref AnalyzerFunction
+                - LambdaInvokePolicy:
+                      FunctionName: !Ref GeneratorFunction
+                - LambdaInvokePolicy:
+                      FunctionName: !Ref ValidatorFunction
+                - CloudWatchLogsFullAccess
+
+Outputs:
+    ApiUrl:
+        Description: GateShift API base URL
+        Value: !Sub "https://${GateShiftApi}.execute-api.${AWS::Region}.amazonaws.com/dev"
+    UserPoolId:
+        Description: Cognito User Pool ID (set as VITE_COGNITO_USER_POOL_ID)
+        Value: !Ref UserPool
+    UserPoolClientId:
+        Description: Cognito App Client ID (set as VITE_COGNITO_CLIENT_ID)
+        Value: !Ref UserPoolClient
+    Region:
+        Description: Deployment region (set as VITE_AWS_REGION)
+        Value: !Ref AWS::Region
+    ArtifactsBucketName:
+        Value: !Ref ArtifactsBucket
+    MigrationsTableName:
+        Value: !Ref MigrationsTable

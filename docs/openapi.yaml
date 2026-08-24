@@ -1,0 +1,551 @@
+openapi: 3.0.3
+info:
+  title: GateShift API
+  version: 1.0.0
+  description: >
+    REST API for GateShift — an AI-powered tool that migrates Kong Gateway
+    configurations to Amazon API Gateway (SAM templates).
+
+    ## Authentication
+    Every endpoint is protected by an Amazon Cognito User Pool authorizer.
+    Clients first obtain a Cognito **ID token** (out of band, via the Cognito
+    `InitiateAuth` API against the User Pool app client) and send it in the
+    `Authorization` header on every request. Requests without a valid token
+    receive `401`.
+
+    ## Typical flow
+    1. `POST /uploads/presign` → returns a presigned S3 URL.
+    2. Client `PUT`s the Kong YAML directly to that S3 URL (this is an S3
+       endpoint, not part of this API).
+    3. `POST /migrations` → starts the async Step Functions pipeline.
+    4. Poll `GET /migrations/{id}` until `status` is terminal
+       (`COMPLETE` / `NEEDS_REVIEW` / `FAILED`).
+    5. `GET /migrations/{id}/report` and
+       `GET /migrations/{id}/artifact/{artifact}` to read results.
+
+    ## Ownership
+    Resources are scoped to the caller (Cognito `sub`). Reading another user's
+    migration returns `404` (not `403`) so existence cannot be probed.
+
+servers:
+  - url: https://{apiId}.execute-api.{region}.amazonaws.com/dev
+    description: Deployed stage
+    variables:
+      apiId:
+        default: n4lj0j556g
+        description: API Gateway REST API ID (from the ApiUrl stack output)
+      region:
+        default: us-east-1
+
+security:
+  - CognitoIdToken: []
+
+tags:
+  - name: Uploads
+    description: Presigned upload URLs for source configs
+  - name: Migrations
+    description: Create, list, and inspect migrations
+  - name: Artifacts
+    description: Retrieve generated migration artifacts
+
+paths:
+  /uploads/presign:
+    post:
+      tags: [Uploads]
+      summary: Get a presigned S3 URL to upload a Kong config
+      description: >
+        Returns a short-lived presigned `PUT` URL. The client uploads the YAML
+        file directly to S3 under a per-user prefix. The URL expires in 5 minutes.
+      operationId: presignUpload
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PresignUploadRequest'
+      responses:
+        '200':
+          description: Presigned upload URL created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PresignUploadResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /migrations:
+    post:
+      tags: [Migrations]
+      summary: Create and start a migration
+      description: >
+        Records the migration and starts the Step Functions pipeline. The
+        `configS3Key` must reference an object the caller uploaded (it is
+        validated against the caller's own `input/{sub}/` prefix).
+      operationId: createMigration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMigrationRequest'
+      responses:
+        '201':
+          description: Migration created and pipeline started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateMigrationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: The provided configS3Key does not belong to the caller
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Failed to start the migration pipeline
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    get:
+      tags: [Migrations]
+      summary: List the caller's migrations
+      description: Returns up to 50 of the caller's migrations, newest first.
+      operationId: listMigrations
+      responses:
+        '200':
+          description: List of migrations owned by the caller
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [migrations]
+                properties:
+                  migrations:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/MigrationListItem'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /migrations/{id}:
+    get:
+      tags: [Migrations]
+      summary: Get a migration's status and summary
+      operationId: getMigration
+      parameters:
+        - $ref: '#/components/parameters/MigrationId'
+      responses:
+        '200':
+          description: Migration details (internal fields omitted)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Migration'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /migrations/{id}/report:
+    get:
+      tags: [Migrations]
+      summary: Get the full validation report
+      description: >
+        Available only once the migration has finished
+        (`COMPLETE` or `NEEDS_REVIEW`). Returns `409` while still in progress.
+      operationId: getReport
+      parameters:
+        - $ref: '#/components/parameters/MigrationId'
+      responses:
+        '200':
+          description: Validation report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationReport'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Migration is still in progress
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /migrations/{id}/artifact/{artifact}:
+    get:
+      tags: [Artifacts]
+      summary: Get an artifact's text content (for in-app preview / download)
+      description: >
+        Returns the artifact content through the authenticated API. Content is
+        capped at ~1 MB and must be UTF-8 text.
+      operationId: getArtifact
+      parameters:
+        - $ref: '#/components/parameters/MigrationId'
+        - $ref: '#/components/parameters/ArtifactName'
+      responses:
+        '200':
+          description: Artifact content
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactContent'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          description: Artifact too large to preview
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          description: Artifact is not previewable text
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /migrations/{id}/download/{artifact}:
+    get:
+      tags: [Artifacts]
+      summary: Get a presigned S3 download URL for an artifact
+      description: >
+        Returns a short-lived presigned `GET` URL (expires in 5 minutes).
+        Retained for compatibility; the current UI uses the `/artifact/` route.
+      operationId: presignDownload
+      parameters:
+        - $ref: '#/components/parameters/MigrationId'
+        - $ref: '#/components/parameters/ArtifactName'
+      responses:
+        '200':
+          description: Presigned download URL
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PresignDownloadResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    CognitoIdToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Amazon Cognito **ID token** sent in the `Authorization` header. The API
+        Gateway Cognito authorizer validates it against the User Pool.
+
+  parameters:
+    MigrationId:
+      name: id
+      in: path
+      required: true
+      description: Migration identifier (UUID)
+      schema:
+        type: string
+        format: uuid
+    ArtifactName:
+      name: artifact
+      in: path
+      required: true
+      description: Which generated artifact to fetch
+      schema:
+        type: string
+        enum: [template, report, migration-report, authorizer, normalized, plan]
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing or invalid Cognito ID token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Resource not found (or not owned by the caller)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          example: Migration not found
+      required: [error]
+
+    MigrationStatus:
+      type: string
+      enum:
+        - PENDING
+        - PARSING
+        - ANALYZING
+        - GENERATING
+        - VALIDATING
+        - COMPLETE
+        - NEEDS_REVIEW
+        - FAILED
+
+    TargetApiType:
+      type: string
+      enum: [REST, HTTP]
+
+    MappingType:
+      type: string
+      enum: [direct, lambda, alternative, gap]
+
+    PresignUploadRequest:
+      type: object
+      required: [fileName]
+      properties:
+        fileName:
+          type: string
+          description: A simple .yaml or .yml filename (no path separators)
+          pattern: '^[A-Za-z0-9._-]{1,120}\.(ya?ml)$'
+          example: kong.yaml
+
+    PresignUploadResponse:
+      type: object
+      required: [uploadUrl, s3Key, maxBytes]
+      properties:
+        uploadUrl:
+          type: string
+          format: uri
+          description: Presigned S3 PUT URL (expires in 5 minutes)
+        s3Key:
+          type: string
+          example: input/8b1c.../a1b2c3d4/kong.yaml
+        maxBytes:
+          type: integer
+          example: 5242880
+
+    CreateMigrationRequest:
+      type: object
+      required: [configS3Key]
+      properties:
+        sourceType:
+          type: string
+          enum: [kong]
+          default: kong
+        configS3Key:
+          type: string
+          description: S3 key returned by /uploads/presign (must be the caller's own)
+          example: input/8b1c.../a1b2c3d4/kong.yaml
+        fileName:
+          type: string
+          default: config.yaml
+
+    CreateMigrationResponse:
+      type: object
+      required: [migrationId]
+      properties:
+        migrationId:
+          type: string
+          format: uuid
+
+    MigrationSummary:
+      type: object
+      properties:
+        direct_count:
+          type: integer
+        lambda_count:
+          type: integer
+        alternative_count:
+          type: integer
+        gap_count:
+          type: integer
+        estimated_effort_hours:
+          type: number
+
+    MigrationListItem:
+      type: object
+      properties:
+        migration_id:
+          type: string
+          format: uuid
+        source_type:
+          type: string
+          example: kong
+        status:
+          $ref: '#/components/schemas/MigrationStatus'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        file_name:
+          type: string
+        confidence_score:
+          type: number
+          nullable: true
+        target_api_type:
+          allOf:
+            - $ref: '#/components/schemas/TargetApiType'
+          nullable: true
+
+    Migration:
+      type: object
+      description: Detailed migration record (internal fields such as owner_sub and config_s3_key are omitted)
+      properties:
+        migration_id:
+          type: string
+          format: uuid
+        source_type:
+          type: string
+        status:
+          $ref: '#/components/schemas/MigrationStatus'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        file_name:
+          type: string
+        confidence_score:
+          type: number
+          nullable: true
+        target_api_type:
+          allOf:
+            - $ref: '#/components/schemas/TargetApiType'
+          nullable: true
+        summary:
+          $ref: '#/components/schemas/MigrationSummary'
+        error_message:
+          type: string
+          nullable: true
+
+    CoverageResult:
+      type: object
+      properties:
+        total:
+          type: integer
+        covered:
+          type: integer
+        percentage:
+          type: number
+        details:
+          type: array
+          items:
+            type: string
+
+    FeatureMapping:
+      type: object
+      properties:
+        source_feature:
+          type: string
+        source_plugin_name:
+          type: string
+          example: rate-limiting
+        aws_equivalent:
+          type: string
+          example: Usage Plan Throttling
+        mapping_type:
+          $ref: '#/components/schemas/MappingType'
+        implementation_notes:
+          type: string
+
+    GapItem:
+      type: object
+      properties:
+        source_feature:
+          type: string
+        source_plugin_name:
+          type: string
+        category:
+          type: string
+        severity:
+          type: string
+          enum: [low, medium, high, critical]
+        recommendation:
+          type: string
+        effort_estimate_hours:
+          type: number
+
+    ValidationReport:
+      type: object
+      properties:
+        migration_id:
+          type: string
+          format: uuid
+        confidence_score:
+          type: number
+          example: 87.5
+        target_api_type:
+          $ref: '#/components/schemas/TargetApiType'
+        target_api_type_reasoning:
+          type: string
+        route_coverage:
+          $ref: '#/components/schemas/CoverageResult'
+        auth_coverage:
+          $ref: '#/components/schemas/CoverageResult'
+        plugin_coverage:
+          $ref: '#/components/schemas/CoverageResult'
+        feature_mappings:
+          type: array
+          items:
+            $ref: '#/components/schemas/FeatureMapping'
+        gaps:
+          type: array
+          items:
+            $ref: '#/components/schemas/GapItem'
+        warnings:
+          type: array
+          items:
+            type: string
+        summary:
+          $ref: '#/components/schemas/MigrationSummary'
+
+    ArtifactContent:
+      type: object
+      required: [artifact, filename, content]
+      properties:
+        artifact:
+          type: string
+          example: template
+        filename:
+          type: string
+          example: template.yaml
+        content:
+          type: string
+          description: UTF-8 artifact content
+
+    PresignDownloadResponse:
+      type: object
+      required: [url, artifact]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: Presigned S3 GET URL (expires in 5 minutes)
+        artifact:
+          type: string

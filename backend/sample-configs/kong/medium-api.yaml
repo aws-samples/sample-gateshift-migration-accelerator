@@ -1,0 +1,89 @@
+_format_version: "3.0"
+services:
+    - name: payment-service
+      url: http://payment-backend:8080
+      routes:
+          - name: payments-route
+            paths:
+                - /api/v1/payments
+            methods:
+                - POST
+                - GET
+          - name: payment-detail-route
+            paths:
+                - /api/v1/payments/(?P<id>[^/]+)
+            methods:
+                - GET
+                - PUT
+                - DELETE
+      plugins:
+          - name: key-auth
+            config:
+                key_names:
+                    - apikey
+                    - x-api-key
+          - name: rate-limiting
+            config:
+                minute: 100
+                policy: local
+          - name: cors
+            config:
+                origins:
+                    - "https://app.example.com"
+                    - "https://admin.example.com"
+                methods:
+                    - GET
+                    - POST
+                    - PUT
+                    - DELETE
+                headers:
+                    - Authorization
+                    - Content-Type
+                    - X-Api-Key
+                max_age: 3600
+
+    - name: user-service
+      url: http://user-backend:8080
+      routes:
+          - name: users-route
+            paths:
+                - /api/v1/users
+            methods:
+                - GET
+                - POST
+          - name: user-profile-route
+            paths:
+                - /api/v1/users/me
+            methods:
+                - GET
+                - PUT
+      plugins:
+          - name: jwt
+            config:
+                uri_param_names:
+                    - token
+                claims_to_verify:
+                    - exp
+          - name: rate-limiting
+            config:
+                minute: 60
+                policy: local
+          - name: request-validator
+            config:
+                body_schema: |
+                    {
+                      "type": "object",
+                      "properties": {
+                        "email": {"type": "string", "format": "email"},
+                        "name": {"type": "string", "minLength": 1}
+                      },
+                      "required": ["email", "name"]
+                    }
+
+consumers:
+    - username: mobile-app
+      keyauth_credentials:
+          - key: mobile-app-key-001
+    - username: web-frontend
+      keyauth_credentials:
+          - key: web-frontend-key-001

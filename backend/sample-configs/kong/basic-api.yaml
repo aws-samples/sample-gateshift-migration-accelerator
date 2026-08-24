@@ -1,0 +1,10 @@
+_format_version: "3.0"
+services:
+    - name: hello-service
+      url: http://httpbin.org:80
+      routes:
+          - name: hello-route
+            paths:
+                - /hello
+            methods:
+                - GET

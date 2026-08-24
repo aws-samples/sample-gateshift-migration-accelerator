@@ -1,0 +1,235 @@
+_format_version: "3.0"
+services:
+    - name: order-service
+      url: http://order-backend:8080
+      routes:
+          - name: orders-list
+            paths:
+                - /api/v1/orders
+            methods:
+                - GET
+                - POST
+          - name: orders-detail
+            paths:
+                - /api/v1/orders/(?P<id>[^/]+)
+            methods:
+                - GET
+                - PUT
+                - DELETE
+          - name: orders-status
+            paths:
+                - /api/v1/orders/(?P<id>[^/]+)/status
+            methods:
+                - GET
+                - PATCH
+      plugins:
+          - name: jwt
+            config:
+                claims_to_verify:
+                    - exp
+                    - nbf
+                key_claim_name: kid
+          - name: acl
+            config:
+                allow:
+                    - order-readers
+                    - order-writers
+          - name: rate-limiting
+            config:
+                second: 10
+                minute: 200
+                policy: redis
+                redis_host: redis.internal
+          - name: request-transformer
+            config:
+                add:
+                    headers:
+                        - "X-Request-Source:api-gateway"
+                        - "X-Correlation-Id:$(correlation_id)"
+                remove:
+                    headers:
+                        - "X-Internal-Only"
+          - name: response-transformer
+            config:
+                remove:
+                    headers:
+                        - "X-Powered-By"
+                        - "Server"
+                add:
+                    headers:
+                        - "X-Response-Time:$(latency)"
+          - name: cors
+            config:
+                origins:
+                    - "https://orders.example.com"
+                methods:
+                    - GET
+                    - POST
+                    - PUT
+                    - DELETE
+                    - PATCH
+                headers:
+                    - Authorization
+                    - Content-Type
+                credentials: true
+                max_age: 7200
+
+    - name: inventory-service
+      url: http://inventory-backend:8080
+      routes:
+          - name: inventory-list
+            paths:
+                - /api/v1/inventory
+            methods:
+                - GET
+          - name: inventory-update
+            paths:
+                - /api/v1/inventory/(?P<sku>[^/]+)
+            methods:
+                - PUT
+                - PATCH
+      plugins:
+          - name: key-auth
+            config:
+                key_names:
+                    - x-api-key
+          - name: ip-restriction
+            config:
+                allow:
+                    - 10.0.0.0/8
+                    - 172.16.0.0/12
+                deny:
+                    - 0.0.0.0/0
+          - name: proxy-cache
+            config:
+                response_code:
+                    - 200
+                request_method:
+                    - GET
+                content_type:
+                    - application/json
+                cache_ttl: 300
+          - name: rate-limiting
+            config:
+                minute: 500
+                policy: local
+
+    - name: notification-service
+      url: http://notification-backend:8080
+      routes:
+          - name: notifications-send
+            paths:
+                - /api/v1/notifications
+            methods:
+                - POST
+          - name: notifications-webhooks
+            paths:
+                - /api/v1/webhooks
+            methods:
+                - POST
+                - GET
+                - DELETE
+      plugins:
+          - name: basic-auth
+            config:
+                hide_credentials: true
+          - name: request-size-limiting
+            config:
+                allowed_payload_size: 5
+          - name: http-log
+            config:
+                http_endpoint: https://logs.example.com/ingest
+                method: POST
+                timeout: 5000
+
+    - name: analytics-service
+      host: analytics-upstream
+      port: 8080
+      protocol: http
+      routes:
+          - name: analytics-query
+            paths:
+                - /api/v1/analytics
+            methods:
+                - POST
+          - name: analytics-dashboard
+            paths:
+                - /api/v1/dashboards
+            methods:
+                - GET
+      plugins:
+          - name: oauth2
+            config:
+                scopes:
+                    - analytics:read
+                    - analytics:write
+                mandatory_scope: true
+                enable_authorization_code: true
+          - name: bot-detection
+            config:
+                allow:
+                    - googlebot
+                    - bingbot
+                deny:
+                    - scrapy
+
+    - name: health-service
+      url: http://health-backend:8080
+      routes:
+          - name: health-check
+            paths:
+                - /health
+                - /ready
+            methods:
+                - GET
+      plugins:
+          - name: request-termination
+            config:
+                status_code: 200
+                message: '{"status": "healthy"}'
+                content_type: "application/json"
+
+upstreams:
+    - name: analytics-upstream
+      algorithm: round-robin
+      targets:
+          - target: analytics-1.internal:8080
+            weight: 100
+          - target: analytics-2.internal:8080
+            weight: 100
+      healthchecks:
+          active:
+              http_path: /health
+              healthy:
+                  interval: 5
+                  successes: 3
+              unhealthy:
+                  interval: 5
+                  http_failures: 3
+
+consumers:
+    - username: internal-service
+      keyauth_credentials:
+          - key: internal-svc-key-001
+      acls:
+          - group: order-readers
+          - group: order-writers
+    - username: external-partner
+      keyauth_credentials:
+          - key: partner-key-001
+      acls:
+          - group: order-readers
+    - username: monitoring-bot
+      basicauth_credentials:
+          - username: monitor
+            password: secure-monitor-pass
+
+plugins:
+    - name: correlation-id
+      config:
+          header_name: X-Correlation-ID
+          generator: uuid
+          echo_downstream: true
+    - name: file-log
+      config:
+          path: /var/log/kong/access.log

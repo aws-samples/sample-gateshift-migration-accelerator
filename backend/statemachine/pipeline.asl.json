@@ -1,0 +1,89 @@
+{
+    "Comment": "GateShift Migration Pipeline",
+    "StartAt": "ParseConfig",
+    "States": {
+        "ParseConfig": {
+            "Type": "Task",
+            "Resource": "${ParserFunctionArn}",
+            "Next": "AnalyzeWithBedrock",
+            "ResultPath": "$.parseResult",
+            "Catch": [
+                {
+                    "ErrorEquals": ["States.ALL"],
+                    "Next": "MigrationFailed",
+                    "ResultPath": "$.error"
+                }
+            ]
+        },
+        "AnalyzeWithBedrock": {
+            "Type": "Task",
+            "Resource": "${AnalyzerFunctionArn}",
+            "Next": "GenerateTemplate",
+            "ResultPath": "$.analyzeResult",
+            "Retry": [
+                {
+                    "ErrorEquals": ["ThrottlingException"],
+                    "IntervalSeconds": 5,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                }
+            ],
+            "Catch": [
+                {
+                    "ErrorEquals": ["States.ALL"],
+                    "Next": "MigrationFailed",
+                    "ResultPath": "$.error"
+                }
+            ]
+        },
+        "GenerateTemplate": {
+            "Type": "Task",
+            "Resource": "${GeneratorFunctionArn}",
+            "Next": "ValidateMigration",
+            "ResultPath": "$.generateResult",
+            "Catch": [
+                {
+                    "ErrorEquals": ["States.ALL"],
+                    "Next": "MigrationFailed",
+                    "ResultPath": "$.error"
+                }
+            ]
+        },
+        "ValidateMigration": {
+            "Type": "Task",
+            "Resource": "${ValidatorFunctionArn}",
+            "Next": "CheckConfidence",
+            "ResultPath": "$.validateResult",
+            "Catch": [
+                {
+                    "ErrorEquals": ["States.ALL"],
+                    "Next": "MigrationFailed",
+                    "ResultPath": "$.error"
+                }
+            ]
+        },
+        "CheckConfidence": {
+            "Type": "Choice",
+            "Choices": [
+                {
+                    "Variable": "$.validateResult.confidence_score",
+                    "NumericGreaterThanEquals": 80,
+                    "Next": "MigrationComplete"
+                }
+            ],
+            "Default": "MigrationNeedsReview"
+        },
+        "MigrationComplete": {
+            "Type": "Succeed"
+        },
+        "MigrationNeedsReview": {
+            "Type": "Succeed",
+            "Comment": "Confidence below 80% - manual review recommended"
+        },
+        "MigrationFailed": {
+            "Type": "Fail",
+            "Error": "MigrationError",
+            "Cause": "Pipeline failed during execution"
+        }
+    }
+}

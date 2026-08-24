@@ -1,0 +1,241 @@
+_format_version: "3.0"
+services:
+    - name: catalog-service
+      url: http://catalog-backend:8080
+      routes:
+          - name: catalog-browse
+            paths:
+                - /api/v1/catalog
+            methods:
+                - GET
+          - name: catalog-title
+            paths:
+                - /api/v1/catalog/(?P<title_id>[^/]+)
+            methods:
+                - GET
+          - name: catalog-search
+            paths:
+                - /api/v1/search
+            methods:
+                - GET
+      plugins:
+          - name: key-auth
+            config:
+                key_names:
+                    - x-api-key
+                    - apikey
+          - name: proxy-cache
+            config:
+                response_code:
+                    - 200
+                request_method:
+                    - GET
+                content_type:
+                    - application/json
+                cache_ttl: 120
+          - name: rate-limiting
+            config:
+                minute: 1000
+                policy: redis
+                redis_host: redis.streaming.internal
+          - name: response-transformer
+            config:
+                add:
+                    headers:
+                        - "Cache-Control:public, max-age=120"
+          - name: cors
+            config:
+                origins:
+                    - "https://watch.example.com"
+                    - "https://tv.example.com"
+                methods:
+                    - GET
+                headers:
+                    - Authorization
+                    - Content-Type
+                max_age: 3600
+
+    - name: playback-service
+      host: playback-upstream
+      port: 8080
+      protocol: http
+      routes:
+          - name: playback-manifest
+            paths:
+                - /api/v1/playback/(?P<title_id>[^/]+)/manifest
+            methods:
+                - GET
+          - name: playback-license
+            paths:
+                - /api/v1/playback/(?P<title_id>[^/]+)/license
+            methods:
+                - POST
+      plugins:
+          - name: jwt
+            config:
+                claims_to_verify:
+                    - exp
+                key_claim_name: kid
+          - name: acl
+            config:
+                allow:
+                    - premium-subscribers
+                    - standard-subscribers
+          - name: rate-limiting
+            config:
+                second: 20
+                policy: local
+          - name: request-transformer
+            config:
+                add:
+                    headers:
+                        - "X-Device-Id:$(consumer_custom_id)"
+                remove:
+                    headers:
+                        - "X-Internal-Debug"
+
+    - name: profiles-service
+      url: http://profiles-backend:8080
+      routes:
+          - name: profiles-detail
+            paths:
+                - /api/v1/profiles/(?P<profile_id>[^/]+)
+            methods:
+                - GET
+                - PUT
+                - DELETE
+          - name: profiles-watchlist
+            paths:
+                - /api/v1/profiles/(?P<profile_id>[^/]+)/watchlist
+            methods:
+                - GET
+                - POST
+                - DELETE
+      plugins:
+          - name: oauth2
+            config:
+                scopes:
+                    - profile:read
+                    - profile:write
+                mandatory_scope: true
+                enable_authorization_code: true
+          - name: request-validator
+            config:
+                body_schema: |
+                    {
+                      "type": "object",
+                      "properties": {
+                        "display_name": {"type": "string", "minLength": 1, "maxLength": 50},
+                        "maturity_level": {"type": "string", "enum": ["kids", "teen", "adult"]}
+                      },
+                      "required": ["display_name"]
+                    }
+          - name: rate-limiting
+            config:
+                minute: 300
+                policy: local
+
+    - name: recommendations-service
+      host: recommendations-upstream
+      port: 9090
+      protocol: http
+      routes:
+          - name: recommendations-feed
+            paths:
+                - /api/v1/recommendations
+            methods:
+                - GET
+      plugins:
+          - name: key-auth
+            config:
+                key_names:
+                    - x-api-key
+          - name: bot-detection
+            config:
+                allow:
+                    - googlebot
+                deny:
+                    - scrapy
+                    - curl
+          - name: proxy-cache
+            config:
+                response_code:
+                    - 200
+                request_method:
+                    - GET
+                cache_ttl: 60
+
+    - name: health-service
+      url: http://health-backend:8080
+      routes:
+          - name: health-check
+            paths:
+                - /health
+                - /ready
+            methods:
+                - GET
+      plugins:
+          - name: request-termination
+            config:
+                status_code: 200
+                message: '{"status": "ok"}'
+                content_type: "application/json"
+
+upstreams:
+    - name: playback-upstream
+      algorithm: round-robin
+      targets:
+          - target: playback-1.internal:8080
+            weight: 100
+          - target: playback-2.internal:8080
+            weight: 100
+          - target: playback-3.internal:8080
+            weight: 100
+      healthchecks:
+          active:
+              http_path: /health
+              healthy:
+                  interval: 5
+                  successes: 3
+              unhealthy:
+                  interval: 5
+                  http_failures: 2
+    - name: recommendations-upstream
+      algorithm: least-connections
+      targets:
+          - target: reco-1.internal:9090
+            weight: 100
+          - target: reco-2.internal:9090
+            weight: 100
+
+consumers:
+    - username: web-player
+      keyauth_credentials:
+          - key: web-player-key-001
+      acls:
+          - group: standard-subscribers
+    - username: smart-tv-app
+      keyauth_credentials:
+          - key: smart-tv-key-001
+      acls:
+          - group: premium-subscribers
+    - username: partner-cdn
+      keyauth_credentials:
+          - key: partner-cdn-key-001
+
+plugins:
+    - name: correlation-id
+      config:
+          header_name: X-Correlation-ID
+          generator: uuid
+          echo_downstream: true
+    - name: datadog
+      config:
+          host: datadog-agent.internal
+          port: 8125
+          metrics:
+              - request_count
+              - latency
+    - name: request-size-limiting
+      config:
+          allowed_payload_size: 8
